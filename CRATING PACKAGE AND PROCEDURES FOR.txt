@@ -1,0 +1,437 @@
+CRATING PACKAGE AND PROCEDURES FOR MWS
+
+create or replace PACKAGE pkg_mws_ferry_dwh_load AS
+
+    -- 1. Load Date Dimension
+    PROCEDURE pr_mws_load_date_dim;
+
+    -- 2. Load Passenger Dimension
+    PROCEDURE pr_mws_fb_passenger_dim;
+
+    -- 3. Load Vessel Dimension
+    PROCEDURE pr_mws_fb_load_vessel_dim;
+
+    -- 4. Load Service Class Dimension
+    PROCEDURE pr_mws_fb_load_service_class_dim;
+
+    -- 5. Load Operations Fact Table
+    PROCEDURE pr_mws_fb_load_operations_fact;
+
+    -- 6. Master Orchestration Procedure
+    PROCEDURE pr_mws_fb_run_full_etl;
+
+END pkg_mws_ferry_dwh_load;
+
+
+create or replace PACKAGE BODY pkg_mws_ferry_dwh_load AS
+
+   -- -----------------------------------------------------------------
+    -- 1. LOAD DATE DIMENSION (MERGE - NO TRUNCATE)
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_load_date_dim IS
+    BEGIN
+        MERGE INTO MWS.MWS_FB_DATE_DIM D
+        USING (
+            SELECT
+                TO_NUMBER(TO_CHAR(dt, 'YYYYMMDD')) AS DATE_KEY,
+                dt AS FULL_DATE,
+                EXTRACT(YEAR FROM dt) AS YEAR,
+                TO_NUMBER(TO_CHAR(dt, 'Q')) AS QUARTER,
+                EXTRACT(MONTH FROM dt) AS MONTH_NUMBER,
+                TO_CHAR(dt, 'Month') AS MONTH_NAME,
+                TO_NUMBER(TO_CHAR(dt, 'D')) AS DAY_OF_WEEK_NUMBER,
+                TO_CHAR(dt, 'Day') AS DAY_NAME,
+                CASE
+                    WHEN TO_CHAR(dt, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('FRI', 'SAT') THEN 1
+                    ELSE 0
+                END AS IS_WEEKEND,
+                'ETL_GENERATED_CALENDAR' AS DATA_SOURCE
+            FROM (
+                SELECT TRUNC(TO_DATE('2000-01-01', 'YYYY-MM-DD')) + LEVEL - 1 AS dt
+                FROM DUAL
+                CONNECT BY LEVEL <= (
+                    TO_DATE(EXTRACT(YEAR FROM SYSDATE) + 10 || '-12-31', 'YYYY-MM-DD')
+                    - TRUNC(TO_DATE('2000-01-01', 'YYYY-MM-DD'))
+                ) + 1
+            )
+        ) S
+        ON (D.DATE_KEY = S.DATE_KEY)
+
+        WHEN MATCHED THEN
+        UPDATE SET
+            D.FULL_DATE          = S.FULL_DATE,
+            D.YEAR               = S.YEAR,
+            D.QUARTER            = S.QUARTER,
+            D.MONTH_NUMBER       = S.MONTH_NUMBER,
+            D.MONTH_NAME         = S.MONTH_NAME,
+            D.DAY_OF_WEEK_NUMBER = S.DAY_OF_WEEK_NUMBER,
+            D.DAY_NAME           = S.DAY_NAME,
+            D.IS_WEEKEND         = S.IS_WEEKEND,
+            D.UPDATED_AT         = SYSTIMESTAMP,
+            D.DATA_SOURCE        = S.DATA_SOURCE
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            DATE_KEY,
+            FULL_DATE,
+            YEAR,
+            QUARTER,
+            MONTH_NUMBER,
+            MONTH_NAME,
+            DAY_OF_WEEK_NUMBER,
+            DAY_NAME,
+            IS_WEEKEND,
+            UPDATED_AT,
+            DATA_SOURCE,
+            INSERT_AT
+        )
+        VALUES (
+            S.DATE_KEY,
+            S.FULL_DATE,
+            S.YEAR,
+            S.QUARTER,
+            S.MONTH_NUMBER,
+            S.MONTH_NAME,
+            S.DAY_OF_WEEK_NUMBER,
+            S.DAY_NAME,
+            S.IS_WEEKEND,
+            SYSTIMESTAMP,
+            S.DATA_SOURCE,
+            SYSTIMESTAMP
+        );
+
+        COMMIT;
+
+        DBMS_OUTPUT.PUT_LINE('Run Successfully');
+    END pr_mws_load_date_dim;
+
+ -- -----------------------------------------------------------------
+    -- 2. LOAD PASSENGER DIMENSION (MERGE ONLY - NO TRUNCATE)
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_fb_passenger_dim IS
+    BEGIN
+        MERGE INTO MWS.MWS_FB_PASSENGER_DIM P
+        USING (
+            WITH date_ref AS (
+                SELECT TRUNC(SYSDATE) AS curr_date FROM DUAL
+            ),
+            dedup_src AS (
+                SELECT
+                    CAST(PX.ID AS VARCHAR2(50)) AS SOURCE_SYSTEM_KEY,
+                    PX.NAME AS PASSENGER_NAME,
+                    PX.GENDER AS GENDER,
+                    PX.NATIONALITYID AS NATIONALITY_NAME,
+                    CASE
+                        WHEN PX.DOB IS NULL THEN 'Unknown'
+                        WHEN TRUNC(MONTHS_BETWEEN(d.curr_date, TO_DATE(REGEXP_SUBSTR(PX.DOB, '^\d{4}-\d{2}-\d{2}'), 'YYYY-MM-DD')) / 12) < 12 THEN 'Child'
+                        WHEN TRUNC(MONTHS_BETWEEN(d.curr_date, TO_DATE(REGEXP_SUBSTR(PX.DOB, '^\d{4}-\d{2}-\d{2}'), 'YYYY-MM-DD')) / 12) < 18 THEN 'Youth'
+                        WHEN TRUNC(MONTHS_BETWEEN(d.curr_date, TO_DATE(REGEXP_SUBSTR(PX.DOB, '^\d{4}-\d{2}-\d{2}'), 'YYYY-MM-DD')) / 12) < 65 THEN 'Adult'
+                        ELSE 'Senior'
+                    END AS AGE_GROUP,
+                    PX.IDCARDNO AS ID_CARD_NO,
+                    NVL(CX.ISGUEST, 0) AS IS_GUEST,
+                    1 AS IS_PASSENGER,
+                    CASE
+                        WHEN BL.PASSENGERIDCARD IS NOT NULL THEN 1
+                        ELSE 0
+                    END AS IS_BLACKLISTED,
+                    'MWS_FERRY' AS SRC_DATA_SOURCE,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            CAST(PX.ID AS VARCHAR2(50)),
+                            NVL(PX.IDCARDNO, '<NULL>')
+                        ORDER BY
+                            CASE WHEN BL.PASSENGERIDCARD IS NOT NULL THEN 1 ELSE 0 END DESC,
+                            PX.NAME NULLS LAST
+                    ) AS rn
+                FROM MWS.MWS_FERRY_PASSENGER_EXT_R PX
+                CROSS JOIN date_ref d
+                LEFT JOIN MWS.MWS_FB_CUSTOMER_EXT_R CX
+                    ON PX.ID = CX.ID
+                LEFT JOIN MWS.MWS_FB_PASSENGER_BLACKLIST_EXT_R BL
+                    ON PX.IDCARDNO = BL.PASSENGERIDCARD
+            )
+            SELECT
+                SOURCE_SYSTEM_KEY,
+                PASSENGER_NAME,
+                GENDER,
+                NATIONALITY_NAME,
+                AGE_GROUP,
+                ID_CARD_NO,
+                IS_GUEST,
+                IS_PASSENGER,
+                IS_BLACKLISTED,
+                SRC_DATA_SOURCE
+            FROM dedup_src
+            WHERE rn = 1
+        ) SRC
+        ON (
+            P.SOURCE_SYSTEM_KEY = SRC.SOURCE_SYSTEM_KEY
+            AND NVL(P.ID_CARD_NO, '<NULL>') = NVL(SRC.ID_CARD_NO, '<NULL>')
+        )
+
+        WHEN MATCHED THEN
+        UPDATE SET
+            P.PASSENGER_NAME   = SRC.PASSENGER_NAME,
+            P.GENDER           = SRC.GENDER,
+            P.NATIONALITY_NAME = SRC.NATIONALITY_NAME,
+            P.AGE_GROUP        = SRC.AGE_GROUP,
+            P.IS_GUEST         = SRC.IS_GUEST,
+            P.IS_PASSENGER     = SRC.IS_PASSENGER,
+            P.IS_BLACKLISTED   = SRC.IS_BLACKLISTED,
+            P.UPDATED_AT       = SYSTIMESTAMP,
+            P.DATA_SOURCE      = SRC.SRC_DATA_SOURCE
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            SOURCE_SYSTEM_KEY, PASSENGER_NAME, GENDER, NATIONALITY_NAME,
+            AGE_GROUP, ID_CARD_NO, IS_GUEST, IS_PASSENGER, IS_BLACKLISTED,
+            UPDATED_AT, DATA_SOURCE, INSERT_AT
+        )
+        VALUES (
+            SRC.SOURCE_SYSTEM_KEY, SRC.PASSENGER_NAME, SRC.GENDER, SRC.NATIONALITY_NAME,
+            SRC.AGE_GROUP, SRC.ID_CARD_NO, SRC.IS_GUEST, SRC.IS_PASSENGER, SRC.IS_BLACKLISTED,
+            SYSTIMESTAMP, SRC.SRC_DATA_SOURCE, SYSTIMESTAMP
+        );
+
+        COMMIT;
+
+        DBMS_OUTPUT.PUT_LINE('Passenger Dimension Loaded Successfully');
+    END pr_mws_fb_passenger_dim;
+    -- -----------------------------------------------------------------
+    -- 3. LOAD VESSEL DIMENSION
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_fb_load_vessel_dim IS 
+    BEGIN 
+        MERGE INTO MWS.MWS_FB_VESSEL_DIM V 
+        USING (
+            SELECT 
+                VX.ID, VX.VESSEL, 
+                VX.CODE, 
+                CASE WHEN VX.STATUS = 'Active' then 'Y' ELSE 'N'  END ACTIVE, 
+                FX.TYPE AS V_TYPE, 
+                CAST(REGEXP_SUBSTR(FX.PASSENGERS, '\d+') AS NUMBER) AS PASSENGERS, 
+                CAST(REGEXP_SUBSTR(FX.VEHICLES, '\d+') AS NUMBER) AS VEHICLES
+            FROM MWS_FB_VESSEL_EXT_R VX
+            LEFT JOIN MWS_FB_FLEETDETAILS_EXT_R FX 
+                ON UPPER(TRIM(VX.VESSEL)) = UPPER(TRIM(FX.FLEETNAME))
+        ) SRC
+        ON (V.VESSEL_ID = SRC.ID)
+        
+        WHEN MATCHED THEN 
+        UPDATE SET 
+            V.VESSEL_NAME        = SRC.VESSEL, 
+            V.VESSEL_CODE        = SRC.CODE, 
+            V.IS_ACTIVE          = SRC.ACTIVE, 
+            V.VESSEL_TYPE        = SRC.V_TYPE, 
+            V.PASSENGER_CAPACITY = SRC.PASSENGERS, 
+            V.VEHICLE_CAPACITY   = SRC.VEHICLES, 
+            V.UPDATED_AT         = SYSTIMESTAMP, 
+            V.DATA_SOURCE        = 'MWS_FB'
+            
+        WHEN NOT MATCHED THEN 
+        INSERT (
+            VESSEL_ID, VESSEL_NAME, VESSEL_CODE, IS_ACTIVE, VESSEL_TYPE, 
+            PASSENGER_CAPACITY, VEHICLE_CAPACITY, UPDATED_AT, DATA_SOURCE, INSERT_AT
+        ) 
+        VALUES (
+            SRC.ID, SRC.VESSEL, SRC.CODE, SRC.ACTIVE, SRC.V_TYPE, 
+            SRC.PASSENGERS, SRC.VEHICLES, SYSTIMESTAMP, 
+            'MWS_FB', 
+            SYSTIMESTAMP
+        );
+        COMMIT;
+    END pr_mws_fb_load_vessel_dim;
+
+    -- -----------------------------------------------------------------
+    -- 4. LOAD SERVICE CLASS DIMENSION
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_fb_load_service_class_dim IS 
+    BEGIN 
+        MERGE INTO MWS_FB_SERVICE_CLASS_DIM SC 
+        USING MWS_FB_SERVICECLASS_EXT_R SCX 
+        ON (SC.SERVICE_CLASS_ID = SCX.ID) 
+        
+        WHEN MATCHED THEN 
+        UPDATE SET
+            SC.SERVICE_CLASS_NAME = SCX.SERVICECLASSNAME,
+            SC.UPDATED_AT = SYSTIMESTAMP,
+            SC.DATA_SOURCE = 'MWS_FB'
+             
+        WHEN NOT MATCHED THEN 
+        INSERT (
+            SERVICE_CLASS_ID, SERVICE_CLASS_NAME, UPDATED_AT, DATA_SOURCE, INSERT_AT
+        )
+        VALUES (
+            SCX.ID, SCX.SERVICECLASSNAME, SYSTIMESTAMP, 'MWS_FB', SYSTIMESTAMP
+        );
+        COMMIT;
+        
+        dbms_output.put_line('Run Successfully');
+    END pr_mws_fb_load_service_class_dim;
+
+    -- -----------------------------------------------------------------
+    -- 5. LOAD OPERATIONS FACT TABLE
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_fb_load_operations_fact IS 
+    BEGIN 
+        MERGE INTO MWS.MWS_FB_OPERATIONS_FACT F
+        USING (
+            SELECT 
+                DISTINCT
+                SRC.SOURCE_SYSTEM_KEY,
+                SRC.OPERATION_TYPE,
+                SRC.TRIP_CODE,
+                SRC.BOOKING_ID,
+                NVL(D.DATE_KEY, -1) AS DATE_KEY,
+                NVL(V.VESSEL_KEY, -1) AS VESSEL_KEY,
+                NVL(R.ROUT_KEY, -1) AS ROUT_KEY,
+                NVL(P.PASSENGER_KEY, -1) AS PASSENGER_KEY,
+                NVL(SC.SERVICE_CLASS_KEY, -1) AS SERVICE_CLASS_KEY,
+                SRC.DATA_SOURCE
+            FROM (
+                -- Global deduplication using ROW_NUMBER() over the entire combined dataset
+                SELECT 
+                    RAW_SRC.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY RAW_SRC.SOURCE_SYSTEM_KEY, RAW_SRC.DATA_SOURCE 
+                        ORDER BY RAW_SRC.EVENT_DATE DESC
+                    ) AS global_rn
+                FROM (
+                    -- Branch 1: Vessel Bookings
+                    SELECT 
+                        CAST(
+                            CASE 
+                                WHEN REGEXP_LIKE(TRIM(VB.ID), '^\d+$') THEN TRIM(VB.ID)
+                                ELSE NULL 
+                            END AS NUMBER
+                        ) AS SOURCE_SYSTEM_KEY,
+                        CAST('Trip' AS VARCHAR2(50)) AS OPERATION_TYPE,
+                        CAST(VB.CODE AS VARCHAR2(50)) AS TRIP_CODE,
+                        CAST(NULL AS VARCHAR2(50)) AS BOOKING_ID,
+                        VB."DATE" AS EVENT_DATE,
+                        CAST(VB.VESSELID AS NUMBER) AS SOURCE_VESSEL_ID,
+                        CAST(VB.ROUTENO AS VARCHAR2(50)) AS SOURCE_ROUTE_NO,
+                        CAST(NULL AS NUMBER) AS SOURCE_PASSENGER_ID,
+                        CAST(NULL AS NUMBER) AS SOURCE_SERVICE_CLASS_ID,
+                        CAST('MWS_FB' AS VARCHAR2(100)) AS DATA_SOURCE
+                    FROM MWS.MWS_FB_VESSELBOOKINGS_EXT_R VB
+
+                    UNION ALL
+
+                    -- Branch 2: Reporting For Boarding
+                    SELECT 
+                        CAST(
+                            CASE 
+                                WHEN REGEXP_LIKE(TRIM(RB.ID), '^\d+$') THEN TRIM(RB.ID)
+                                ELSE NULL 
+                            END AS NUMBER
+                        ) AS SOURCE_SYSTEM_KEY,
+                        CAST(
+                            CASE 
+                                WHEN UPPER(TRIM(RB.REPORTINGTYPE)) IN ('PASSENGER', 'BOARDING PASSENGER') THEN 'Boarding Passenger'
+                                WHEN UPPER(TRIM(RB.REPORTINGTYPE)) IN ('VEHICLE', 'BOARDING VEHICLE') THEN 'Boarding Vehicle'
+                                ELSE RB.REPORTINGTYPE
+                            END AS VARCHAR2(50)
+                        ) AS OPERATION_TYPE,
+                        CAST(NULL AS VARCHAR2(50)) AS TRIP_CODE,
+                        CAST(RB.BOOKINGID AS VARCHAR2(50)) AS BOOKING_ID,
+                        RB.TRIPDATE AS EVENT_DATE,
+                        CAST(NULL AS NUMBER) AS SOURCE_VESSEL_ID,
+                        CAST(NULL AS VARCHAR2(50)) AS SOURCE_ROUTE_NO,
+                        CAST(
+                            CASE 
+                                WHEN UPPER(TRIM(RB.REPORTINGTYPE)) IN ('PASSENGER', 'BOARDING PASSENGER') THEN RB.PAXID 
+                                ELSE NULL 
+                            END AS NUMBER
+                        ) AS SOURCE_PASSENGER_ID,
+                        CAST(BK.SERVICECLASSID AS NUMBER) AS SOURCE_SERVICE_CLASS_ID,
+                        CAST('MWS_FB' AS VARCHAR2(100)) AS DATA_SOURCE
+                    FROM MWS.MWS_FB_REPORTINGFORBOARDING_EXT_R RB
+                    LEFT JOIN MWS.MWS_FB_BOOKING_EXT_R BK 
+                        ON RB.BOOKINGID = BK.ID
+                ) RAW_SRC
+                WHERE RAW_SRC.SOURCE_SYSTEM_KEY IS NOT NULL
+            ) SRC
+            LEFT JOIN MWS.MWS_FB_DATE_DIM D 
+                ON TRUNC(SRC.EVENT_DATE) = TRUNC(D.FULL_DATE)
+            LEFT JOIN MWS.MWS_FB_VESSEL_DIM V 
+                ON SRC.SOURCE_VESSEL_ID = V.VESSEL_ID
+            LEFT JOIN MWS.MWS_FB_ROUT_DIM R 
+                ON SRC.SOURCE_ROUTE_NO = R.ROUTE_NO
+            LEFT JOIN MWS.MWS_FB_PASSENGER_DIM P 
+                ON SRC.SOURCE_PASSENGER_ID = CASE 
+                    WHEN REGEXP_LIKE(TRIM(P.SOURCE_SYSTEM_KEY), '^\d+$') THEN TO_NUMBER(TRIM(P.SOURCE_SYSTEM_KEY))
+                    ELSE NULL 
+                END
+            LEFT JOIN MWS.MWS_FB_SERVICE_CLASS_DIM SC 
+                ON SRC.SOURCE_SERVICE_CLASS_ID = SC.SERVICE_CLASS_ID
+            WHERE SRC.global_rn = 1
+        ) NEW_DATA
+        ON (F.SOURCE_SYSTEM_KEY = NEW_DATA.SOURCE_SYSTEM_KEY AND F.DATA_SOURCE = NEW_DATA.DATA_SOURCE)
+
+        WHEN MATCHED THEN
+        UPDATE SET 
+            F.OPERATION_TYPE    = NEW_DATA.OPERATION_TYPE,
+            F.TRIP_CODE         = NEW_DATA.TRIP_CODE,
+            F.BOOKING_ID        = NEW_DATA.BOOKING_ID,
+            F.DATE_KEY          = NEW_DATA.DATE_KEY,
+            F.VESSEL_KEY        = NEW_DATA.VESSEL_KEY,
+            F.ROUT_KEY          = NEW_DATA.ROUT_KEY,
+            F.PASSENGER_KEY     = NEW_DATA.PASSENGER_KEY,
+            F.SERVICE_CLASS_KEY = NEW_DATA.SERVICE_CLASS_KEY,
+            F.UPDATED_AT        = SYSTIMESTAMP
+            
+        WHEN NOT MATCHED THEN
+        INSERT (
+            SOURCE_SYSTEM_KEY, OPERATION_TYPE, TRIP_CODE, BOOKING_ID,
+            DATE_KEY, VESSEL_KEY, ROUT_KEY, PASSENGER_KEY, SERVICE_CLASS_KEY,
+            UPDATED_AT, DATA_SOURCE, INSERT_AT
+        )
+        VALUES (
+            NEW_DATA.SOURCE_SYSTEM_KEY, NEW_DATA.OPERATION_TYPE, NEW_DATA.TRIP_CODE, NEW_DATA.BOOKING_ID,
+            NEW_DATA.DATE_KEY, NEW_DATA.VESSEL_KEY, NEW_DATA.ROUT_KEY, NEW_DATA.PASSENGER_KEY, NEW_DATA.SERVICE_CLASS_KEY,
+            SYSTIMESTAMP, NEW_DATA.DATA_SOURCE, SYSTIMESTAMP
+        );
+
+        COMMIT;
+    END pr_mws_fb_load_operations_fact;
+
+    -- -----------------------------------------------------------------
+    -- 6. MASTER ORCHESTRATION PROCEDURE
+    -- -----------------------------------------------------------------
+    PROCEDURE pr_mws_fb_run_full_etl IS
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE('========================================');
+        DBMS_OUTPUT.PUT_LINE('STARTING MWS DATA WAREHOUSE ETL PIPELINE');
+        DBMS_OUTPUT.PUT_LINE('========================================');
+
+        DBMS_OUTPUT.PUT_LINE('-> Loading Date Dimension...');
+        pr_mws_load_date_dim;
+
+        DBMS_OUTPUT.PUT_LINE('-> Loading Passenger Dimension...');
+        pr_mws_fb_passenger_dim;
+
+        DBMS_OUTPUT.PUT_LINE('-> Loading Vessel Dimension...');
+        pr_mws_fb_load_vessel_dim;
+
+        DBMS_OUTPUT.PUT_LINE('-> Loading Service Class Dimension...');
+        pr_mws_fb_load_service_class_dim;
+
+        DBMS_OUTPUT.PUT_LINE('-> Loading Operations Fact Table...');
+        pr_mws_fb_load_operations_fact;
+
+        DBMS_OUTPUT.PUT_LINE('========================================');
+        DBMS_OUTPUT.PUT_LINE('PIPELINE COMPLETED SUCCESSFULLY!');
+        DBMS_OUTPUT.PUT_LINE('========================================');
+        
+        COMMIT;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('*** ERROR IN ETL PIPELINE: ' || SQLERRM || ' ***');
+            RAISE;
+    END pr_mws_fb_run_full_etl;
+
+END pkg_mws_ferry_dwh_load;
